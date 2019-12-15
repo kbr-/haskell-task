@@ -15,7 +15,9 @@ import Control.Monad.IO.Class
 
 import Data.IORef
 import Control.Concurrent
+import Control.Concurrent.Async (withAsync, waitCatch)
 import Control.Concurrent.STM
+import Control.Exception
 
 import GHC.TypeLits
 
@@ -44,15 +46,17 @@ newtype Task mod (d :: Nat) a = Task
     { runTask :: IO (TaskValue mod d a) }
 
 data TaskValue mod (d :: Nat) a where
-    Pure :: a -> TaskValue mod d a
-    Call :: (Module mod', d' + 1 <= d) => Task mod' d' b -> (b -> Task mod d a) -> TaskValue mod d a
-    Send :: Module mod' => Task mod' d' () -> Task mod d a -> TaskValue mod d a
+    Pure  :: a -> TaskValue mod d a
+    Call  :: (Module mod', d' + 1 <= d) => Task mod' d' b -> (b -> Task mod d a) -> TaskValue mod d a
+    Send  :: Module mod' => Task mod' d' () -> Task mod d a -> TaskValue mod d a
+    Async :: IO b -> (Either SomeException b -> Task mod d a) -> TaskValue mod d a
 
 instance Functor (Task mod d) where
     fmap f (Task m) = Task $ flip fmap m $ \case
-        Pure v -> Pure $ f v
+        Pure v        -> Pure        $ f v
         Call remote k -> Call remote $ fmap f . k
         Send remote v -> Send remote $ fmap f v
+        Async op k    -> Async op    $ fmap f . k
 
 instance Applicative (Task mod d) where
     pure = Task . pure . Pure
@@ -65,9 +69,11 @@ instance Monad (Task mod d) where
             Pure v        -> runTask $ f v
             Call remote k -> pure $ Call remote $ k >=> f
             Send remote m -> pure $ Send remote $ m >>= f
+            Async op k    -> pure $ Async op    $ k >=> f
         )
 
 instance MonadIO (Task mod d) where
+    -- TODO: this is unsafe, the IO op might throw, consider using Async for everything
     liftIO = Task . fmap Pure
 
 call :: (Module mod', d' + 1 <= d) => Task mod' d' a -> Task mod d a
@@ -75,6 +81,9 @@ call t = Task $ pure $ Call t pure
 
 send :: Module mod' => Task mod' d' () -> Task mod d ()
 send t = Task $ pure $ Send t $ pure ()
+
+async :: IO a -> Task mod d (Either SomeException a)
+async op = Task $ pure $ Async op pure
 
 data ResponseChain a b where
     NoResponse   :: ResponseChain () b
@@ -126,6 +135,9 @@ process i (Msg (Task t) resp) = do
             dbg $ "sent remote " ++ show i
             msend $ Msg m resp
             dbg $ "sent to myself " ++ show i
+        Async op k -> (=<<) (\_ -> pure ()) $ forkIO $ do
+            res <- withAsync op waitCatch
+            msend $ Msg (k res) resp
 
 msend :: Module mod => Msg mod -> IO ()
 msend msg = do
@@ -156,6 +168,19 @@ instance Module M1 where
 instance Module M2 where
     mailbox = m2box
 
+testasync :: Task M1 0 ()
+testasync = do
+    liftIO $ putStrLn $ "testasync start"
+    res <- async $ do
+        liftIO $ putStrLn $ "async thread start"
+        _ <- error $ "error!"
+        threadDelay 5000000
+        liftIO $ putStrLn $ "async thread stop"
+        pure (5 :: Int)
+    case res of
+        Left err -> liftIO $ putStrLn $ "testasync err: " ++ show err
+        Right v  -> liftIO $ putStrLn $ "testasync val: " ++ show v
+
 test1 :: Task M1 0 ()
 test1 = send $ f1 0
 
@@ -163,11 +188,13 @@ f1 :: Int -> Task M2 0 ()
 f1 x = do
     liftIO $ putStrLn $ "f1 " ++ show x
     send $ g1 (x + 1)
+    liftIO $ putStrLn $ "f1 sent " ++ show (x + 1) ++ " to g1"
 
 g1 :: Int -> Task M1 0 ()
 g1 x = do
     liftIO $ putStrLn $ "g1 " ++ show x
     send $ f1 (x + 1)
+    liftIO $ putStrLn $ "g1 sent " ++ show (x + 1) ++ " to f1"
 
 test2 :: Task M2 1 ()
 test2 = liftIO (newIORef 0) >>= send . f2
@@ -195,5 +222,6 @@ main = do
 
     msend $ Msg test1 NoResponse
     msend $ Msg test2 NoResponse
+    msend $ Msg testasync NoResponse
     _ <- forkIO $ executor 1 (Proxy :: Proxy M1)
     executor 2 (Proxy :: Proxy M2)
